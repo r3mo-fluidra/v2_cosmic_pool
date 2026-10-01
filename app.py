@@ -5,12 +5,14 @@ import time
 from typing import Sequence
 
 import streamlit as st
+import logging
 from neo4j import GraphDatabase
 from langfuse import Langfuse, propagate_attributes
 from langfuse.langchain import CallbackHandler
 from langchain_core.messages import HumanMessage
 
 # Import your compiled LangGraph workflow
+from src.agent.memory_writer import write_turn
 from src.agent.identity import TurnIdentity, new_session_id, new_turn_id, thread_key
 from src.agent.graph import graph
 from src.ui.copy import (
@@ -51,6 +53,7 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
+logger = logging.getLogger(__name__)
 # Deep Water (dark) / Sunlit Lagoon (light). Must run before any other widget:
 # it reads the slider's session-state value and paints every surface below.
 inject_theme()
@@ -1098,6 +1101,18 @@ def run_turn(
     # única pintada, y el turno se ve igual que antes.
     if final_response:
         _paint_partial(final_response)
+        
+    try:
+        write_turn(
+            identity,
+            user_message=prompt,
+            assistant_message=final_response,
+            skip_extraction=not plan_steps,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "memory write raised unexpectedly: %s: %s", type(exc).__name__, exc
+        )
 
     return (
         final_response,
