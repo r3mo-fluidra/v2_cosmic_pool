@@ -11,6 +11,7 @@ from langfuse.langchain import CallbackHandler
 from langchain_core.messages import HumanMessage
 
 # Import your compiled LangGraph workflow
+from src.agent.identity import TurnIdentity, new_session_id, new_turn_id, thread_key
 from src.agent.graph import graph
 from src.ui.copy import (
     FOOTER_PHASE,
@@ -97,6 +98,11 @@ TRACE_NAME = "pool-turn"
 
 SYNTHETIC_USERS = {"dev": "0001", "admin": "0002", "user": "0003"}
 DEFAULT_USER = "user"
+
+DEV_SITE_ID = "site-dev-001"
+DEV_VESSELS = {"Main pool": "vessel-pool-001", "Spa": "vessel-spa-001"}
+DEFAULT_VESSEL = "Main pool"
+DEV_POOL_PRO_ID = "pro-dev-001"
 
 @st.cache_resource
 def get_langfuse():
@@ -285,8 +291,12 @@ prewarm_retrieval()
 # ==========================================
 # SESSION STATE INITIALIZATION
 # ==========================================
-if "thread_id" not in st.session_state:
-    st.session_state.thread_id = str(uuid.uuid4())
+if "session_id" not in st.session_state:
+    st.session_state.session_id = new_session_id()
+if "vessel_label" not in st.session_state:
+    st.session_state.vessel_label = DEFAULT_VESSEL
+if "vessel_id" not in st.session_state:
+    st.session_state.vessel_id = DEV_VESSELS[DEFAULT_VESSEL]
 if "messages" not in st.session_state:
     st.session_state.messages = initial_messages()
 # Which answers currently have their sources panel open, keyed by trace id.
@@ -308,23 +318,50 @@ if "user_role" not in st.session_state:
     st.session_state.user_role = DEFAULT_USER
 if "user_id" not in st.session_state:
     st.session_state.user_id = SYNTHETIC_USERS[DEFAULT_USER]
+# thread_id is derived, not stored: the source of truth is
+# (user_id, vessel_id, session_id). Recomputed on every rerun, so the three
+# call sites that read it directly as a trace seed stay consistent.
+st.session_state.thread_id = thread_key(
+    st.session_state.user_id,
+    st.session_state.vessel_id,
+    st.session_state.session_id,
+)
 
 
 
 
-def _on_user_change() -> None:
+def _start_new_conversation() -> None:
     """
-    Cambiar de usuario abre una conversación nueva: el historial en pantalla,
-    el thread_id del checkpointer y los ratings pertenecen al usuario anterior.
-    Sin este reinicio, los turnos siguientes quedarían guardados bajo el
-    user_id nuevo pero con el contexto del anterior.
+    Open a fresh conversation: new session_id, empty transcript, cleared
+    ratings. Everything that belongs to the previous conversation is dropped.
+
+    thread_id is not reset here: it is recomputed from
+    (user_id, vessel_id, session_id) on the next rerun.
     """
-    st.session_state.user_id = SYNTHETIC_USERS[st.session_state.user_role]
-    st.session_state.thread_id = str(uuid.uuid4())
+    st.session_state.session_id = new_session_id()
     st.session_state.messages = initial_messages()
     st.session_state.turn_counter = 0
     st.session_state.feedback = {}
     st.session_state.sources_open = {}
+
+
+def _on_user_change() -> None:
+    """
+    Switching user opens a new conversation: the transcript, the checkpointer
+    thread and the ratings belong to the previous person.
+    """
+    st.session_state.user_id = SYNTHETIC_USERS[st.session_state.user_role]
+    _start_new_conversation()
+
+
+def _on_vessel_change() -> None:
+    """
+    Switching vessel opens a new conversation too. A pool and a spa do not
+    share volume, sanitization or turnover, so carrying the previous vessel's
+    history into the new thread would feed the specialists wrong context.
+    """
+    st.session_state.vessel_id = DEV_VESSELS[st.session_state.vessel_label]
+    _start_new_conversation()
 
 
 with st.sidebar:
@@ -335,6 +372,13 @@ with st.sidebar:
         key="user_role",
         on_change=_on_user_change,
     )
+    st.selectbox(
+        "Vessel",
+        options=list(DEV_VESSELS),
+        key="vessel_label",
+        on_change=_on_vessel_change,
+    )
+
 # The diagnostics that used to occupy the sidebar (session id, interaction and
 # score counts, graph status) are intentionally not displayed: they are control
 # and tracking data for us, not for the user. Nothing is lost — thread_id ships
@@ -783,12 +827,9 @@ page_footer(FOOTER_TEAM, FOOTER_PHASE)
 
 # Reset stays available, kept quiet and off the phone.
 with st.container(key="pa-reset", horizontal=True, horizontal_alignment="center"):
-    if st.button("Reset conversation"):
-        st.session_state.messages = initial_messages()
-        st.session_state.thread_id = str(uuid.uuid4())
-        st.session_state.feedback = {}
-        st.session_state.turn_counter = 0
-        st.rerun()
+        if st.button("Reset conversation"):
+            _start_new_conversation()
+            st.rerun()
 
 # ── Reading position ──────────────────────────────────────────────────────
 # Last thing on the page, so the helper's iframe — collapsed to zero height by
@@ -862,14 +903,28 @@ def run_turn(
     `detected_language` as soon as that arrives. Both are "es"/"en"
     (src/agent/nodes.py:231), so no mapping is needed.
     """
+    identity = TurnIdentity(
+        user_id=st.session_state.user_id,
+        site_id=DEV_SITE_ID,
+        vessel_id=st.session_state.vessel_id,
+        session_id=st.session_state.session_id,
+        turn_id=new_turn_id(),
+        pool_pro_id=DEV_POOL_PRO_ID,
+    )
+
     config = {
-        "configurable": {"thread_id": st.session_state.thread_id},
+        "configurable": identity.to_configurable(),
         "callbacks": [CallbackHandler()] if lf else [],
         # No langfuse_trace_id here: in v3 the handler takes trace identity from
         # the active OTel context (the span we open below), not from metadata.
-        # These two are plain business metadata, useful when filtering.
+        # user_id and session_id are now distinct, so Langfuse can group traces
+        # by person across conversations instead of treating every thread as a
+        # separate user.
         "metadata": {
-            "thread_id": st.session_state.thread_id,
+            "user_id": identity.user_id,
+            "session_id": identity.session_id,
+            "vessel_id": identity.vessel_id,
+            "thread_id": identity.thread_id,
             "turn_index": turn_index,
         },
     }
@@ -1107,7 +1162,7 @@ if prompt:
             # Context manager: llamado suelto no aplica nada (el trace
             # 41354a9f tenía userId, sessionId y tags vacíos).
             user_id=st.session_state.user_id,
-            session_id=st.session_state.thread_id,
+            session_id=st.session_state.session_id,
             tags=["streamlit", "pool-assistant"],
             metadata={"turn_index": str(turn_index)},
         ):

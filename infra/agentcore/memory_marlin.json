@@ -1,0 +1,34 @@
+{
+  "name": "marlin_memory_dev",
+  "description": "Marlin pool assistant. Short-term events plus extracted vessel facts and user preferences. Equipment inventory is written directly, without a strategy.",
+  "eventExpiryDuration": 30,
+  "namespaceKeys": [
+    { "key": "siteid",    "validation": { "regexPattern": "^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$" } },
+    { "key": "vesselid",  "validation": { "regexPattern": "^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$" } },
+    { "key": "poolproid", "validation": { "regexPattern": "^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$" } }
+  ],
+  "indexedKeys": [
+    { "key": "recordkind",  "type": "STRING" },
+    { "key": "robotid",     "type": "STRING" },
+    { "key": "robotmodel",  "type": "STRING" },
+    { "key": "robotstatus", "type": "STRING" },
+    { "key": "vesselref",   "type": "STRINGLIST" }
+  ],
+  "memoryStrategies": [
+    {
+      "userPreferenceMemoryStrategy": {
+        "name": "marlin_user_prefs",
+        "description": "Language, units, technical level, tone, preferred answer length.",
+        "namespaceTemplates": ["/{actorId}/prefs"]
+      }
+    },
+    {
+      "semanticMemoryStrategy": {
+        "name": "marlin_vessel_facts",
+        "description": "Durable facts about the vessel and its installation.",
+        "namespaceTemplates": ["/{actorId}/sites/{siteid}/vessels/{vesselid}/facts"]
+      }
+    }
+  ],
+  "tags": { "project": "marlin", "env": "dev" }
+}

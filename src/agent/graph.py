@@ -105,9 +105,13 @@ Fan-out is not free. Both branches lead to END, so the turn does not close
 until both finish. That is why _SUGGESTER_DEADLINE_S is short and why every
 failure inside the node degrades to [] rather than propagating.
 """
+import os
+import sqlite3
+from pathlib import Path
 
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
 
 from .state import PoolAgentState
 from .nodes import (
@@ -121,6 +125,41 @@ from .nodes import (
     general,
     oos,
 )
+
+# ===============================================================
+# HELPERS
+# ===============================================================
+
+def _default_checkpointer():
+    """
+    Select the checkpointer backend from the environment.
+
+    MARLIN_CHECKPOINTER:
+        "memory" (default) -> InMemorySaver. Process-local, lost on restart.
+        "sqlite"           -> SqliteSaver at MARLIN_CHECKPOINT_DB.
+
+    Sqlite is the local stand-in for a shared backend. It survives a process
+    restart, which is what makes warm resumption testable, but it is still a
+    single-writer file: it does NOT work across AgentCore Runtime replicas.
+    Production needs a shared store (DynamoDB or Postgres).
+
+    check_same_thread=False is required: Streamlit serves from a worker thread
+    and the orchestrator fans steps out across a ThreadPoolExecutor, so the
+    connection is touched from more than one thread.
+    """
+    backend = os.getenv("MARLIN_CHECKPOINTER", "memory").strip().lower()
+
+    if backend == "sqlite":
+        db_path = Path(
+            os.getenv("MARLIN_CHECKPOINT_DB", ".marlin/checkpoints.sqlite")
+        ).expanduser()
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(db_path), check_same_thread=False)
+        return SqliteSaver(conn)
+
+    return InMemorySaver()
+
+
 
 # ================================================================
 # BUILD GRAPH
@@ -203,7 +242,7 @@ def build_graph(checkpointer=None):
     # inside each node — no explicit add_edge needed.
 
     # ── Compile ───────────────────────────────────────────────────────────────
-    _checkpointer = checkpointer or InMemorySaver()
+    _checkpointer = checkpointer or _default_checkpointer()
 
     app = builder.compile(checkpointer=_checkpointer)
     return app
