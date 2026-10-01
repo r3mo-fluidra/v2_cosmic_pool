@@ -302,6 +302,7 @@ class PoolAgentState(TypedDict):
     # ── Public conversation ──────────────────────────────────────────
     messages: Annotated[List[BaseMessage], add_messages]
     conversation_summary: str
+    user_memory: Annotated[List[str], lambda a, b: b]
 
     # ── Planner output ───────────────────────────────────────────────
     detected_language: NotRequired[str]

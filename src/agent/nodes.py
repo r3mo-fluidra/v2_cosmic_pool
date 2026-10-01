@@ -18,6 +18,7 @@ import contextvars
 import json
 import re
 import time
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 import concurrent.futures
 
@@ -26,7 +27,7 @@ from ..graph_context.vessel_detect import detect_vessel, VesselContext
 from .state import PoolAgentState, ExecutionStep, AgentResult
 # PLANNER_PROMPT ya no se importa acá: lo pone create_planner_chain como
 # system del template. Importarlo era lo que invitaba a mandarlo otra vez.
-from ..prompts.prompts import SYNTHESIZER_PROMPT, SUGGESTER_PROMPT, neutralize_tags
+from ..prompts.prompts import SYNTHESIZER_PROMPT, SUGGESTER_PROMPT, neutralize_tags, SESSION_SUMMARY_PROMPT
 from .chains import create_planner_chain
 from ..config.llm import (
     create_llm,
@@ -64,6 +65,15 @@ from ..graph_context.turn_cache import reset_turn
 from ..graph_context.turn_cache import get_touched
 from .tools import begin_tool_scope, vector_search, search_seed_nodes, expand_subgraph
 from ..tool_budgets import RETRIEVAL_TOOL_BUDGETS
+from .memory_writer import (
+    read_vessel_facts,
+    previous_session_id,
+    read_session_transcript,
+    session_already_consolidated,
+    write_session_summary,
+    read_session_summaries,
+)
+from .identity import identity_from_config, IdentityError
 # ================================================================
 # CONFIGURATION
 # ================================================================
@@ -1140,6 +1150,7 @@ def _get_llm_suggester():
 @observe(as_type='agent', name="Context Node")
 def build_context_node(
     state: PoolAgentState,
+    config: RunnableConfig,
 ) -> Command[Literal["summarize_memory_node", "planner"]]:
 
     next_node: Literal["summarize_memory_node", "planner"] = (
@@ -1159,25 +1170,126 @@ def build_context_node(
             b.get("text", "") for b in texto_usuario if isinstance(b, dict)
         )
 
+    
+    user_memory: list[str] = []
+
+    cold_summary = ""
+    is_first_turn = not any(
+        isinstance(m, AIMessage) and getattr(m, "name", None) == "Marlin"
+        for m in (state.get("messages") or [])
+    )
+    if is_first_turn and "identity" in dir():
+        try:
+            previous = previous_session_id(identity, identity.session_id)
+            if previous and not session_already_consolidated(identity, previous):
+                turns = read_session_transcript(identity, previous)
+                summary = _summarize_session(turns)
+                if summary:
+                    write_session_summary(identity, previous, summary)
+
+            summaries = read_session_summaries(identity, limit=2)
+            if summaries:
+                cold_summary = neutralize_tags("\n\n".join(summaries))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "cold resumption degraded: %s: %s", type(exc).__name__, exc
+            )
+
+    try:
+        identity = identity_from_config(config)
+        user_memory = [
+            neutralize_tags(fact) for fact in read_vessel_facts(identity)
+        ]
+    except IdentityError as exc:
+        # Sin identidad no hay memoria posible, pero el turno sigue: el
+        # agente responde como lo hacía antes de que esto existiera.
+        logger.warning("memory read skipped, no identity: %s", exc)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "memory read degraded: %s: %s", type(exc).__name__, exc
+        )
+
     return Command(
         update={
             "turn_started_at": time.time(),
-            
+            "conversation_summary": cold_summary,
             "error": None,
             "planner_error": None,
             "archetype": None,
-            
+
             "vessel": asdict(detect_vessel(texto_usuario)),
             "misroute_retries": 0,
             "response": None,
             "validation": {},
             "suggestions": [],
+            "user_memory": user_memory,
         },
         goto=next_node,
     )
 # ================================================================
 # SUMMARIZE MEMORY NODE
 # ================================================================
+_NOTHING_TO_SUMMARIZE = "NOTHING_TO_SUMMARIZE"
+_SUMMARY_DEADLINE_S = 15.0
+
+
+def _summarize_session(turns: list[tuple[str, str]]) -> str | None:
+    """
+    Condense a finished session into text worth recalling on return.
+
+    Returns None when there is nothing worth storing, or when the call
+    fails: cold resumption without a summary is the behaviour the agent
+    had before this existed, not a broken turn.
+
+    Runs on cold resumption only, never per turn, so a full LLM call is
+    affordable here in a way it would not be in the hot path.
+    """
+    if not turns:
+        return None
+
+        transcript = "\n".join(
+        f"{role.lower()}: {neutralize_tags(text)}" for role, text in turns
+    )
+
+    transcript = "\n".join(
+        f"{role.lower()}: {neutralize_tags(text)}" for role, text in turns
+    )
+
+    # The model has no clock. Without this it writes a placeholder like
+    # "[Current Date]", and a dated symptom is the whole point: three
+    # months on, an undated "the pool was flooded" cannot be placed in time.
+    session_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    messages = [
+        SystemMessage(content=SESSION_SUMMARY_PROMPT),
+        HumanMessage(
+            content=(
+                f"This conversation took place on {session_date}.\n\n"
+                f"<transcript>\n{transcript}\n</transcript>"
+            )
+        ),
+    ]
+
+    try:
+        ctx = contextvars.copy_context()
+        future = _SUGGESTER_POOL.submit(
+            ctx.run, _get_synthesis_llm().invoke, messages
+        )
+        result = future.result(timeout=_SUMMARY_DEADLINE_S)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "session summary failed: %s: %s", type(exc).__name__, exc
+        )
+        return None
+
+    text = _flatten(getattr(result, "content", "")).strip()
+    if not text or _NOTHING_TO_SUMMARIZE in text:
+        logger.info("session summary: nothing worth storing")
+        return None
+    return text
+
+
+
 @observe(as_type='agent', name="Sumarize Node")
 def summarize_memory_node(state: PoolAgentState) -> Command[Literal["planner"]]:
     messages = state.get("messages", [])
@@ -1242,9 +1354,13 @@ def planner(state: PoolAgentState, config: RunnableConfig):
     # llegaba a ningún prompt. La conversación se perdía y encima costaba.
     summary = neutralize_tags((state.get("conversation_summary") or "").strip())
 
-    # Tags en vez de etiquetas planas: "[User reply]:" lo puede escribir el
-    # usuario y fabricar contexto falso; un tag neutralizado no.
     parts = []
+
+    facts = state.get("user_memory") or []
+    if facts:
+        rendered = "\n".join(f"- {f}" for f in facts)
+        parts.append(f"<user_memory>\n{rendered}\n</user_memory>")
+
     if summary:
         parts.append(
             f"<conversation_summary>\n{summary}\n</conversation_summary>"

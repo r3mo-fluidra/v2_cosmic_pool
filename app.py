@@ -12,7 +12,11 @@ from langfuse.langchain import CallbackHandler
 from langchain_core.messages import HumanMessage
 
 # Import your compiled LangGraph workflow
-from src.agent.memory_writer import write_turn
+from src.agent.memory_writer import (
+    write_turn,
+    read_session_history,
+    read_session_transcript,
+)
 from src.agent.identity import TurnIdentity, new_session_id, new_turn_id, thread_key
 from src.agent.graph import graph
 from src.ui.copy import (
@@ -381,6 +385,42 @@ with st.sidebar:
         key="vessel_label",
         on_change=_on_vessel_change,
     )
+    st.divider()
+    st.caption("Conversation history")
+
+    try:
+        history_identity = TurnIdentity(
+            user_id=st.session_state.user_id,
+            site_id=DEV_SITE_ID,
+            vessel_id=st.session_state.vessel_id,
+            session_id=st.session_state.session_id,
+            turn_id="history",
+            pool_pro_id=DEV_POOL_PRO_ID,
+        )
+        history = read_session_history(history_identity, limit=10)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("history sidebar failed: %s: %s", type(exc).__name__, exc)
+        history = []
+
+    if not history:
+        st.caption("No past conversations for this vessel yet.")
+    else:
+        for item in history:
+            label = (
+                item.created_at.strftime("%b %d, %H:%M")
+                if item.created_at
+                else item.session_id[:8]
+            )
+            with st.expander(label):
+                st.markdown(item.text)
+                if st.button("Show transcript", key=f"tr-{item.session_id}"):
+                    st.session_state[f"show-{item.session_id}"] = True
+                if st.session_state.get(f"show-{item.session_id}"):
+                    for role, text in read_session_transcript(
+                        history_identity, item.session_id
+                    ):
+                        who = "You" if role.upper() == "USER" else "Marlin"
+                        st.markdown(f"**{who}:** {text}")
 
 # The diagnostics that used to occupy the sidebar (session id, interaction and
 # score counts, graph status) are intentionally not displayed: they are control
@@ -1101,7 +1141,7 @@ def run_turn(
     # única pintada, y el turno se ve igual que antes.
     if final_response:
         _paint_partial(final_response)
-        
+
     try:
         write_turn(
             identity,
