@@ -58,4 +58,18 @@ def _fake_get_client():
 _fake_langfuse_module = types.ModuleType("langfuse")
 _fake_langfuse_module.observe = _passthrough_observe
 _fake_langfuse_module.get_client = _fake_get_client
+
+# app.py also imports Langfuse (the client class) and propagate_attributes
+# (a context manager) directly, and langfuse.langchain.CallbackHandler for
+# the Streamlit callback wiring. None of nodes.py's tests exercise these, but
+# collecting test/smoke/test_app_smoke.py imports app.py itself, so the stub
+# needs to satisfy app.py's import line too.
+_fake_langfuse_module.Langfuse = MagicMock
+_fake_langfuse_module.propagate_attributes = lambda *a, **k: MagicMock(
+    __enter__=lambda self: None, __exit__=lambda self, *exc: None
+)
 sys.modules["langfuse"] = _fake_langfuse_module
+
+_fake_langfuse_langchain_module = types.ModuleType("langfuse.langchain")
+_fake_langfuse_langchain_module.CallbackHandler = MagicMock
+sys.modules["langfuse.langchain"] = _fake_langfuse_langchain_module
