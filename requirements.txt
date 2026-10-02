@@ -9,6 +9,7 @@ langchain-google-genai>=2.0.0
 langchain-qdrant>=0.2.0
 langgraph>=0.2.0
 langgraph-supervisor>=0.0.31
+langgraph-checkpoint-sqlite>=2.0.0
 langchain-community>=0.3.0
 
 # Vector Store
@@ -20,6 +21,10 @@ neo4j>=5.0.0
 
 # Observability
 langfuse>=2.0.0
+
+# AWS (AgentCore Memory)
+boto3>=1.43.106
+botocore[crt]>=1.43.106
 
 # Data
 pandas>=2.0.0

@@ -12,9 +12,14 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .venv/
+.venv_ci/
 venv/
 
 # macOS
 .DS_Store
 
 .marlin/
+
+# Embedded Qdrant index (regenerated at runtime, not source)
+src/data/qdrant_pool_db/
+*.lock
